@@ -10,7 +10,7 @@ square_size = 20 #size in mm of a square side
 
 #termination critera, accuracy or iterations
 criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 40, 0.0005) 
-
+ 
 #3d world coords for checkerboard
 object_points3D = np.zeros((nX * nY, 3), np.float32)
 object_points3D[:,:2] = np.mgrid[0:nY, 0:nX].T.reshape(-1, 2) * square_size
