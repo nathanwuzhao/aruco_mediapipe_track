@@ -1,413 +1,231 @@
-import cv2 as cv #4.5.5.62
-import numpy as np #1.26.4
-import math
+import cv2 as cv
+import mediapipe as mp
+import numpy as np
 import time
-import threading
-from collections import deque
-from scipy.spatial.transform import Rotation as R
+import math
 
-#global quit flag for camera setup
-quit_flag = False
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-#frame synchronization stuff
-cache_length = 5 #number of frames to cache
-frame_cache= {'cam0': deque(maxlen=cache_length), 'cam1': deque(maxlen=cache_length)}
-cache_lock = threading.Lock()
-sync_event = threading.Event()
-frames_ready = {'cam0': False, 'cam1': False}
+@dataclass
+class Landmark3D:
+    x: float
+    y: float
+    z: float
 
-# joint definitions dictionary with all marker assignments. each joint is between two adjacent markers. 
-# id 11 is used as a placeholder
-joint_definitions = {
-    'LH':{
-        'thumb': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'IP', 'dof':1}, #flexion only
-        ], 
-        'index': [
-            {'proximal': 11, 'distal': 2, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 2, 'distal': 0, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'middle': [
-            {'proximal': 11, 'distal': 7, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 7, 'distal': 10, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'ring': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'pinky': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ]
-    },
-    'RH':{ 
-        'thumb': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'IP', 'dof':1}, #flexion only
-        ], 
-        'index': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'middle': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'ring': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ], 
-        'pinky': [
-            {'proximal': 11, 'distal': 11, 'type': 'MCP', 'dof':2}, #flexion + abduction
-            {'proximal': 11, 'distal': 11, 'type': 'PIP', 'dof':1}, #flexion only
-        ]
-    }
-}
-
-#extract all unique marker ids from joint definitions
-def get_all_marker_ids():
-    marker_ids = set()
-    for hand in joint_definitions:
-        for finger in joint_definitions[hand]:
-            for joint_def in joint_definitions[hand][finger]:
-                marker_ids.add(joint_def['proximal'])
-                marker_ids.add(joint_def['distal'])
+    def as_array(self) -> np.ndarray:
+        return np.array([self.x, self.y, self.z], dtype=np.float64)
     
-    return marker_ids
+@dataclass
+class FingerAngles:
+    mcp: Optional[float] = None
+    dip: Optional[float] = None
+    pip: Optional[float] = None
 
-#initialize, with structure for 2dof
-def initialize_joint_angles():
-    joint_angles = {'LH': {}, 'RH': {}}
+def safe_norm(v: np.ndarray, epsilon: float = 1e-7) -> float:
+    n = np.linalg.norm(v)
+    return n if n > epsilon else epsilon
 
-    for hand in joint_definitions:
-        joint_angles[hand] = {}
-        for finger in joint_definitions[hand]:
-            joint_angles[hand][finger] = {}
-            for i, joint_def in enumerate(joint_definitions[hand][finger]):
-                joint_name = f"{joint_def['type']}" #use joint type as name
+def angle_between_vectors_deg(v1: np.ndarray, v2: np.ndarray) -> float:
+    v1n = v1 / safe_norm(v1)
+    v2n = v2 / safe_norm(v2)
+    dot = np.clip(np.dot(v1n, v2n), -1.0, 1.0)
+    return math.degrees(math.acos(dot))
 
-                if joint_def['dof'] == 1:
-                    joint_angles[hand][finger][joint_name] = None #store as single value
-                else: 
-                    joint_angles[hand][finger][joint_name] = { #store as dictionary
-                        'flexion': None,
-                        'abduction': None 
-                    }
-    return joint_angles
+def flexion_angle_deg(p_prox: np.ndarray, p_joint: np.ndarray, p_dist: np.ndarray) -> float:
+    v1 = p_prox - p_joint
+    v2 = p_dist - p_joint
+    interior = angle_between_vectors_deg(v1, v2)
+    return 180.0 - interior
 
-#initialize these jawns
-joint_angles = initialize_joint_angles()
-hand_data = {'LH': {}, 'RH': {}}
+class MediapipeHandTracker:
+    def __init__(self, model_path: str, num_hands: int = 1, min_hand_detection_confidence: float = 0.5,
+               min_hand_presence_confidence: float = 0.5, min_tracking_confidence: float = 0.5) -> None:
+        self.model_path = str(model_path)
+            
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(
+                f"hand landmarker model file not found: {self.model_path}\n"
+            )
 
-for hand in joint_definitions:
-    for finger in joint_definitions[hand]:
-        hand_data[hand][finger] = {}
-        #get unique marker ids for this finger from joint defs
-        finger_markers = set()
-        for joint_def in joint_definitions[hand][finger]:
-            finger_markers.add(joint_def['proximal'])
-            finger_markers.add(joint_def['distal'])
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        LandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        options = LandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=self.model_path),
+            running_mode=VisionRunningMode.VIDEO,
+            num_hands=num_hands,
+            min_hand_detection_confidence=min_hand_detection_confidence,
+            min_hand_presence_confidence=min_hand_presence_confidence,
+            min_tracking_confidence=min_tracking_confidence
+        )
+
+        self.landmarker = HandLandmarker.create_from_options(options)
+
+    def close(self) -> None:
+        self.landmarker.close()
+
+    def process_bgr_frame(self, frame_bgr: np.ndarray, timestamp_ms: int):
+        frame_rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+        return result
+    
+class MediapipeAngleEstimator:
+    #thumb omitted due to laziness
+    WRIST = 0
+
+    FINGER_LANDMARKS = {
+        "index": {"mcp": 5, "pip": 6, "dip": 7, "tip": 8},
+        "middle": {"mcp": 9, "pip": 10, "dip": 11, "tip": 12},
+        "ring": {"mcp": 13, "pip": 14, "dip": 15, "tip": 16},
+        "pinky": {"mcp": 17, "pip": 18, "dip": 19, "tip": 20},
+    }    
+    
+    def extract_world_landmarks(self, result, hand_index: int,) -> Optional[Dict[int, Landmark3D]]:
+        if not result.hand_world_landmarks:
+            return None
         
-        # initialize each marker
-        for marker_id in finger_markers:
-            hand_data[hand][finger][marker_id] = {
-                'id': marker_id, 
-                'tvec': None,
-                'rvec': None,
-                'rotation_matrix': None,
-                'euler': None,
-                'detected': False
-            }
+        if hand_index >= len(result.hand_world_landmarks):
+            return None
 
-#aruco detection stuff
-aruco_marker_side_length = 9 #mm
-aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_50) #declare aruco tag dictionary
-aruco_parameters = cv.aruco.DetectorParameters_create() #detector parameters
-
-#camera calibration
-calibration_filename = 'calibration_chessboard.yaml' #filename for calibration data
-cv_file = cv.FileStorage(calibration_filename, cv.FILE_STORAGE_READ) #read yaml file
-mtx = cv_file.getNode('K').mat() #get camera matrix
-dst = cv_file.getNode('D').mat() #get camera distortion coefficients
-cv_file.release()
-
-#angle stuff
-euler_order = 'yxz'
-flexion_threshold = 8.0 #degrees
-flexion_axis_default = 'y'
-abduction_axis_default = 'x'
-
-def apply_angle_flexion_threshold(angle, threshold=flexion_threshold):
-    if angle is None:
-        return None
+        lms = result.hand_world_landmarks[hand_index]
+        return {
+            i: Landmark3D(lm.x, lm.y, lm.z)
+            for i, lm in enumerate(lms)
+        }
     
-    abs_angle = abs(angle)
-    return 0.0 if abs_angle < threshold else abs_angle
+    def compute_finger_angles(self, result, hand_index: int = 0) -> Optional[Dict[int, FingerAngles]]:
+        landmarks = self.extract_world_landmarks(result, hand_index)
+        if landmarks is None:
+            return None
 
-def calculate_joint_angle_orient_mat(R1, R2, axis='y'): 
-    #calculate relative rotation using transpose
-    R_rel= np.dot(R2, R1.T)
+        wrist = landmarks[self.WRIST].as_array()
+        out: Dict[str, FingerAngles] = {}
 
-    #convert to scipy Rotation object
-    r_rel = R.from_matrix(R_rel)
-    
-    #extract euler angles
-    euler = r_rel.as_euler(euler_order, degrees=True)
-    axis_map = {'y': 0, 'x': 1, 'z': 2}
-    axis_idx = axis_map.get(axis.lower(), 1) #default to x
-    
-    return euler[axis_idx]
+        for finger_name, index in self.FINGER_LANDMARKS.items():
+            mcp = landmarks[index["mcp"]].as_array()
+            pip = landmarks[index["pip"]].as_array()
+            dip = landmarks[index["dip"]].as_array()
+            tip = landmarks[index["tip"]].as_array()
 
-def calculate_joint_angle_orient_axis(R1, R2, axis='y', reference_vector=None):
-    #θ = signum((OXprx × OXdis) · Vref) * arccos(OXprx · OXdis)
-    
-    # Select axis vectors based on parameter
-    if axis.lower() == 'x':
-        OXprx = R1[:, 0]  # x axis of proximal marker
-        OXdis = R2[:, 0]  # x axis of distal marker
-        default_ref = np.array([0, 1, 0])  # y axis as default reference
-    elif axis.lower() == 'y':
-        OXprx = R1[:, 1]  # y axis of proximal marker
-        OXdis = R2[:, 1]  # y axis of distal marker
-        default_ref = np.array([0, 0, 1])  # z axis as default reference
-    elif axis.lower() == 'z':
-        OXprx = R1[:, 2]  # z axis of proximal marker
-        OXdis = R2[:, 2]  # z axis of distal marker
-        default_ref = np.array([1, 0, 0])  # x axis as default reference
-    else:
-        # Default to y-axis if invalid parameter
-        OXprx = R1[:, 1]
-        OXdis = R2[:, 1] 
-        default_ref = np.array([0, 0, 1])
-
-    #normalize y vectors
-    OXprx = OXprx / np.linalg.norm(OXprx)
-    OXdis = OXdis / np.linalg.norm(OXdis)
-
-    #default reference vector (z axis, up)
-    if reference_vector is None:
-        reference_vector = default_ref
-
-    #normalize (unit vector)
-    reference_vector = reference_vector / np.linalg.norm(reference_vector)
-
-    #calculate dot product (angle magnitude)
-    dot_product = np.dot(OXprx, OXdis)
-    #clamp to [-1, 1], avoid numerical errors in arccos
-    dot_product = np.clip(dot_product, -1.0, 1.0)
-
-    #angle magnitude
-    angle_magnitude = np.arccos(dot_product)
-
-    #cross product because thats what the formula says idk whats going on i slept through this unit in calc3
-    cross_product = np.cross(OXprx, OXdis)
-    #calculate sign using reference vector 
-    sign = np.sign(np.dot(cross_product, reference_vector))
-
-    #final angle, convert to degrees
-    joint_angle = sign * np.degrees(angle_magnitude)
-
-    return joint_angle
-
-def calculate_joint_angles(R1, R2, joint_dof, method='orient_axis', flexion_axis='y', abduction_axis='x'):
-    if joint_dof == '1':
-        if method == 'orient_axis':
-            #use z of proximal marker
-            reference = R1[:,2]
-            angle = calculate_joint_angle_orient_axis(R1, R2, axis=flexion_axis, reference_vector=reference)
-        else:
-            #orient matrix method
-            angle = calculate_joint_angle_orient_mat(R1, R2, axis=flexion_axis)
-
-        return apply_angle_flexion_threshold(angle)
-    
-    elif joint_dof == '2':
-        angles = {}
-
-        if method == 'orient_axis':
-            #use z of proximal marker
-            reference = R1[:,2]    
-            flexion_angle = calculate_joint_angle_orient_axis(R1, R2, axis=flexion_axis, reference_vector=reference)
-            angles['flexion'] = apply_angle_flexion_threshold(flexion_angle)
-
-            abduction_angle = calculate_joint_angle_orient_axis(R1, R2, axis=abduction_axis, reference_vector=reference)
-            angles['abduction'] = abs(abduction_angle) if abduction_angle is not None else None
-
-        else:
-            #uhhh relative rotation thing agian
-            R_rel = np.dot(R2, R1.T)
-            r_rel = R.from_matrix(R_rel)
-            euler = r_rel.as_euler('yxz', degrees=True)
+            mcp_angle = flexion_angle_deg(wrist, mcp, pip)
+            pip_angle = flexion_angle_deg(mcp, pip, dip)
+            dip_angle = flexion_angle_deg(pip, dip, tip)
             
-            #map axes to euler index
-            flexion_idx = {'y': 0, 'x': 1, 'z': 2}.get(flexion_axis, 0)
-            abduction_idx = {'y': 0, 'x': 1, 'z': 2}.get(abduction_axis, 1)
+            out[finger_name] = FingerAngles(
+                mcp=mcp_angle,
+                pip=pip_angle,
+                dip=dip_angle,
+            )
+
+        return out
             
-            # apply threshold to flexion, but not abduction
-            angles['flexion'] = apply_angle_flexion_threshold(euler[flexion_idx])
-            angles['abduction'] = abs(euler[abduction_idx])
 
-    else: 
-        return None
+#drawing helper
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16), 
+    (13, 17), (17, 18), (18, 19), (19, 20),
+]
 
-def calculate_all_joint_angles(method='orient_mat', flexion_axis='y', abduction_axis='x'):
-    #calculate for all finger joints
-    for hand in joint_definitions:
-        for finger in joint_definitions[hand]:
-            joint_defs = joint_definitions[hand][finger]
+def draw_hand_landmarks(frame: np.ndarray, result) -> None:
+    h, w = frame.shape[:2]
 
-            for joint_def in joint_defs:
-                joint_name = joint_def['type']
-                proximal_id = joint_def['proximal']
-                distal_id = joint_def['distal']
-                joint_dof = joint_def['dof']
+    if not result.hand_landmarks:
+        return
 
-                #if both detected
-                if(hand_data[hand][finger][proximal_id]['detected'] and hand_data[hand][finger][distal_id]['detected']):
+    for hand_landmarks in result.hand_landmarks:
+        pts = []
+        for lm in hand_landmarks:
+            x = int(lm.x * w)
+            y = int(lm.y * h)
+            pts.append((x, y))
+            cv.circle(frame, (x, y), 3, (0, 0, 255), -1)
 
-                    # get rotation matrices
-                    R1 = hand_data[hand][finger][proximal_id]['rotation_matrix']
-                    R2 = hand_data[hand][finger][distal_id]['rotation_matrix']
-
-                    if R1 is not None and R2 is not None:
-                        angles = calculate_joint_angles(R1, R2, joint_dof=joint_dof, method=method, flexion_axis=flexion_axis, abduction_axis=abduction_axis)
-                        joint_angles[hand][finger][joint_name] = angles
-                    else:
-                        joint_angles[hand][finger][joint_name] = None if joint_dof == 1 else {
-                            'flexion': None, 'abduction': None
-                        }
-                
-                else:
-                        if joint_dof == 1:
-                            joint_angles[hand][finger][joint_name] = None
-                        else:
-                            joint_angles[hand][finger][joint_name] = {
-                                'flexion': None,
-                                'abduction': None
-                            }
-
-
-def update_marker_data(marker_id, rvec, tvec, rotation_matrix, euler):
-    for hand in joint_definitions:
-        for finger in joint_definitions[hand]:
-            finger_markers = set()
-            for joint_def in joint_definitions[hand][finger]:
-                finger_markers.add(joint_def['proximal'])
-                finger_markers.add(joint_def['distal'])
-
-            if marker_id in finger_markers:
-                hand_data[hand][finger][marker_id]['tvec'] = tvec
-                hand_data[hand][finger][marker_id]['rvec'] = rvec
-                hand_data[hand][finger][marker_id]['rotation_matrix'] = rotation_matrix
-                hand_data[hand][finger][marker_id]['euler'] = euler
-                hand_data[hand][finger][marker_id]['detected'] = True
-                return
-            
-def reset_detection_flags():
-    for hand in hand_data:
-        for finger in hand_data[hand]:
-            for marker_id in hand_data[hand][finger]:
-                hand_data[hand][finger][marker_id]['detected'] = False
-
-def display_joint_angles(frame):
-    y_offset = 30
-    for hand in joint_angles:
-        for finger in joint_angles[hand]:
-            for joint_name, angle_data in joint_angles[hand][finger].items():
-                if angle_data is not None:
-                    if isinstance(angle_data, dict):
-                        # multi-DOF joint
-                        flexion = angle_data.get('flexion')
-                        abduction = angle_data.get('abduction')
-                        
-                        if flexion is not None:
-                            text = f"{hand}_{finger}_{joint_name}_flex: {flexion:.1f}°"
-                            cv.putText(frame, text, (10, y_offset), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                            y_offset += 20
-                        
-                        if abduction is not None:
-                            text = f"{hand}_{finger}_{joint_name}_abd: {abduction:.1f}°"
-                            cv.putText(frame, text, (10, y_offset), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                            y_offset += 20
-                    else:
-                        # single DOF joint
-                        text = f"{hand}_{finger}_{joint_name}: {angle_data:.1f}°"
-                        cv.putText(frame, text, (10, y_offset), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        y_offset += 20
-
-def pose_estimation(frame, matrix_coefficients, distortion_coefficients):
-
-    reset_detection_flags()
-
-    #convert frame to grayscale
-    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-
-    #detect markers
-    (corners, ids, rejected) = cv.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_parameters, cameraMatrix=matrix_coefficients, distCoeff=distortion_coefficients)
+        for i0, i1  in HAND_CONNECTIONS:
+            x0, y0 = pts[i0]
+            x1, y1 = pts[i1]
+            cv.line(frame, (x0, y0), (x1, y1), (42, 205, 54), 2)
     
-    #markers detected
-    if ids is not None:
-        #draw markers with corners and marker ids 
-        cv.aruco.drawDetectedMarkers(frame, corners, ids)
+def draw_angle_text(frame: np.ndarray, finger_angles: Dict[str, FingerAngles], 
+                        hand_index: int = 0, x0: int = 10, y0: int = 30) -> None:
+    y = y0 + hand_index * 120
+    cv.putText(frame, f"hand {hand_index}", (x0, y), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv.LINE_AA)
+    y += 25
 
-        #process each detected marker
-        for i in range(0, len(ids)):
-            marker_id = ids[i][0]
+    for finger_name, angles in finger_angles.items():
+        text = (
+            f"{finger_name.capitalize():6s} | "
+            f"MCP {angles.mcp:6.1f} "
+            f"PIP {angles.pip:6.1f} "
+            f"DIP {angles.dip:6.1f} "
+        )
 
-            #estimate vectors/6D pose; function is deprecated after opencv 4.6, too lazy to figure out solvePnP
-            rvec, tvec, _ = cv.aruco.estimatePoseSingleMarkers(corners[i], aruco_marker_side_length, matrix_coefficients, distortion_coefficients)
-
-            #draw them jawns
-            cv.aruco.drawAxis(frame, matrix_coefficients, distortion_coefficients, rvec, tvec, 8)
-
-            #ravel tvec to get as (3,) array, get translation vectors
-            #transform_translation_x, transform_translation_y, transform_translation_z = tvec.ravel()
-            
-            #reshape this jawn
-            rvec = rvec.reshape(3, 1)
-            #convert rvec to 3x3 rotation matrix
-            output, jacobian = cv.Rodrigues(rvec)
-            rotation_matrix = np.eye(4)
-            rotation_matrix[0:3, 0:3] = output
-
-            #scipy convert this jawn to euler angles
-            r = R.from_matrix(rotation_matrix[0:3, 0:3])
-            euler_angles = r.as_euler(euler_order, degrees=True) #pitch_Y, yaw_Z, roll_x in degrees
-            
-            #update this jawn
-            update_marker_data(marker_id=marker_id, rvec=rvec, tvec=tvec, rotation_matrix=output, euler=euler_angles)
+        cv.putText(frame, text, (x0, y), cv.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 1, cv.LINE_AA)
+        y += 22
         
-        #calculate joint angles after processing all markers
-        calculate_all_joint_angles(method='orient_mat')
-        
-        display_joint_angles(frame)
-            
-    return frame
 
-def main(index):
-    #index this jawn so we can do multiple 
-    capture = cv.VideoCapture(index)
-    if not capture.isOpened(): #could not open
-        print('could not open video source {}'.format(index))
-        exit() #quit
+def main() -> None:
+    model_path = "hand_landmarker.task"
 
-    while True:
-        ret, frame = capture.read()
-        if not ret: #could not read
-            print('could not read from video source {}'.format(0))
-            break #quit
+    tracker = MediapipeHandTracker(
+        model_path = model_path,
+        num_hands = 1, 
+        min_hand_detection_confidence = 0.6, 
+        min_hand_presence_confidence = 0.6,
+        min_tracking_confidence = 0.6
+    )
 
-        #call pose estimation function, show aruco tags with pose estimation
-        output = pose_estimation(frame, mtx, dst)
-        cv.imshow("capture{}".format(index), output)
-
-        if cv.waitKey(1) == ord('q'): #exit if q pressed
-            break
+    angle_estimator = MediapipeAngleEstimator()
     
-    capture.release()
+    cap = cv.VideoCapture(0)
+    if not cap.isOpened():
+        tracker.close()
+        raise RuntimeError("could not open source 0")
+    
+    t0 = time.perf_counter()
+    prev_t = t0
 
-if __name__ == '__main__':
-    #call main on video source 0
-    main(0)
-    cv.destroyAllWindows()
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv.flip(frame, 1)
+
+            timestamp_ms = int((time.perf_counter() - t0) * 1000.0)
+            result = tracker.process_bgr_frame(frame, timestamp_ms)
+            
+            draw_hand_landmarks(frame, result)
+            
+            if result.hand_world_landmarks:
+                for hand_index in range(len(result.hand_world_landmarks)):
+                    finger_angles = angle_estimator.compute_finger_angles(result, hand_index)
+                    if finger_angles is not None:
+                        draw_angle_text(frame, finger_angles, hand_index=hand_index, x0=10, y0=30)
+
+            now = time.perf_counter()
+            fps = 1.0 / max(now - prev_t, 1e-6)
+            prev_t = now
+
+            cv.putText(frame, f"fps: {fps:.1f}", (10, frame.shape[0] - 12), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv.LINE_AA)
+            cv.imshow("mediapipe tasks hand angles", frame)
+            key = cv.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+
+    finally:
+        cap.release()
+        cv.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
