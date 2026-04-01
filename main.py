@@ -1,6 +1,6 @@
-import cv2 as cv
-import mediapipe as mp
-import numpy as np
+import cv2 as cv #4.13.0.92
+import mediapipe as mp #0.10.33
+import numpy as np #2.4.3
 import time
 import math
 
@@ -29,6 +29,12 @@ def safe_norm(v: np.ndarray, epsilon: float = 1e-7) -> float:
     n = np.linalg.norm(v)
     return n if n > epsilon else epsilon
 
+def normalize(v: np.ndarray, epsilon: float = 1e-7) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < epsilon:
+        return np.zeros_like(v, dtype=np.float64)
+    return v / n
+
 def angle_between_vectors_deg(v1: np.ndarray, v2: np.ndarray) -> float:
     v1n = v1 / safe_norm(v1)
     v2n = v2 / safe_norm(v2)
@@ -41,6 +47,24 @@ def flexion_angle_deg(p_prox: np.ndarray, p_joint: np.ndarray, p_dist: np.ndarra
     interior = angle_between_vectors_deg(v1, v2)
     return 180.0 - interior
 
+class ExponentialMovingAverage:
+    def __init__(self, alpha: float = 0.25):
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("alpha must be in (0, 1]")
+        self.alpha = float(alpha)
+        self.value: Optional[float] = None
+
+    def reset(self) -> None:
+        self.value = None
+
+    def update(self, x: float) -> None:
+        x = float(x)
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = self.alpha * x + (1.0 - self.alpha) * self.value
+        return self.value
+        
 class MediapipeHandTracker:
     def __init__(self, model_path: str, num_hands: int = 1, min_hand_detection_confidence: float = 0.5,
                min_hand_presence_confidence: float = 0.5, min_tracking_confidence: float = 0.5) -> None:
@@ -85,7 +109,17 @@ class MediapipeAngleEstimator:
         "middle": {"mcp": 9, "pip": 10, "dip": 11, "tip": 12},
         "ring": {"mcp": 13, "pip": 14, "dip": 15, "tip": 16},
         "pinky": {"mcp": 17, "pip": 18, "dip": 19, "tip": 20},
-    }    
+    } 
+
+    def __init__(self, ema_alpha: float = 0.4, use_ema: bool = True):
+        self.use_ema = use_ema
+        self.filters: Dict[str, ExponentialMovingAverage] = {}
+
+        if use_ema:
+            for finger_name in self.FINGER_LANDMARKS.keys():
+                for joint_name in ("mcp", "pip", "dip"):
+                    key = f"{finger_name}_{joint_name}"
+                    self.filters[key] = ExponentialMovingAverage(alpha=ema_alpha)
     
     def extract_world_landmarks(self, result, hand_index: int,) -> Optional[Dict[int, Landmark3D]]:
         if not result.hand_world_landmarks:
@@ -99,6 +133,11 @@ class MediapipeAngleEstimator:
             i: Landmark3D(lm.x, lm.y, lm.z)
             for i, lm in enumerate(lms)
         }
+    
+    def maybe_filter(self, key: str, value: float) -> float:
+        if not self.use_ema:
+            return value
+        return self.filters[key].update(value)
     
     def compute_finger_angles(self, result, hand_index: int = 0) -> Optional[Dict[int, FingerAngles]]:
         landmarks = self.extract_world_landmarks(result, hand_index)
@@ -114,9 +153,13 @@ class MediapipeAngleEstimator:
             dip = landmarks[index["dip"]].as_array()
             tip = landmarks[index["tip"]].as_array()
 
-            mcp_angle = flexion_angle_deg(wrist, mcp, pip)
-            pip_angle = flexion_angle_deg(mcp, pip, dip)
-            dip_angle = flexion_angle_deg(pip, dip, tip)
+            mcp_angle_raw = flexion_angle_deg(wrist, mcp, pip)
+            pip_angle_raw = flexion_angle_deg(mcp, pip, dip)
+            dip_angle_raw = flexion_angle_deg(pip, dip, tip)
+
+            mcp_angle = self.maybe_filter(f"{finger_name}_mcp", mcp_angle_raw)
+            pip_angle = self.maybe_filter(f"{finger_name}_pip", pip_angle_raw)
+            dip_angle = self.maybe_filter(f"{finger_name}_dip", dip_angle_raw)
             
             out[finger_name] = FingerAngles(
                 mcp=mcp_angle,
