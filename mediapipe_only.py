@@ -21,7 +21,8 @@ class Landmark3D:
     
 @dataclass
 class FingerAngles:
-    mcp: Optional[float] = None
+    mcp_flex: Optional[float] = None
+    mcp_abd: Optional[float] = None
     dip: Optional[float] = None
     pip: Optional[float] = None
 
@@ -125,7 +126,7 @@ class MediapipeAngleEstimator:
 
         if use_ema:
             for finger_name in self.FINGER_LANDMARKS.keys():
-                for joint_name in ("mcp", "pip", "dip"):
+                for joint_name in ("mcp_flex", "mcp_abd", "pip", "dip"):
                     key = f"{finger_name}_{joint_name}"
                     self.filters[key] = ExponentialMovingAverage(alpha=ema_alpha)
     
@@ -163,14 +164,17 @@ class MediapipeAngleEstimator:
         R_palm = np.column_stack((across_palm, y_palm, palm_normal))
         return R_palm
     
-    def mcp_flexion_from_palm(self, mcp: np.ndarray, pip: np.ndarray, R_palm: np.ndarray):
+    def mcp_angles_from_palm(self, mcp: np.ndarray, pip: np.ndarray, R_palm: np.ndarray) -> Tuple[float, float]:
         finger_axis = normalize(pip - mcp)
         v_local = R_palm.T @ finger_axis
         vx, vy, vz = v_local
 
         in_plane_norm = math.sqrt(vx * vx + vy * vy)
-        flexion_deg = math.degrees(math.atan2(abs(vz), in_plane_norm))
-        return flexion_deg
+
+        mcp_flexion_deg = math.degrees(math.atan2(abs(vz), in_plane_norm))
+        mcp_abd_deg = math.degrees(math.atan2(vx, vy)) #sign depends on palm frame convention
+
+        return mcp_flexion_deg, mcp_abd_deg
     
     def maybe_filter(self, key: str, value: float) -> float:
         if not self.use_ema:
@@ -197,17 +201,19 @@ class MediapipeAngleEstimator:
             tip = landmarks[index["tip"]].as_array()
 
             #mcp_angle_raw = flexion_angle_deg(wrist, mcp, pip)
-            mcp_angle_raw = self.mcp_flexion_from_palm(mcp, pip, palm_frame)
+            mcp_flex_raw, mcp_abd_raw = self.mcp_angles_from_palm(mcp, pip, palm_frame)
 
             pip_angle_raw = flexion_angle_deg(mcp, pip, dip)
             dip_angle_raw = flexion_angle_deg(pip, dip, tip)
 
-            mcp_angle = self.maybe_filter(f"{finger_name}_mcp", mcp_angle_raw)
+            mcp_flex = self.maybe_filter(f"{finger_name}_mcp_flex", mcp_flex_raw)
+            mcp_abd = self.maybe_filter(f"{finger_name}_mcp_abd", mcp_abd_raw)
             pip_angle = self.maybe_filter(f"{finger_name}_pip", pip_angle_raw)
             dip_angle = self.maybe_filter(f"{finger_name}_dip", dip_angle_raw)
             
             out[finger_name] = FingerAngles(
-                mcp=mcp_angle,
+                mcp_flex=mcp_flex,
+                mcp_abd=mcp_abd,
                 pip=pip_angle,
                 dip=dip_angle,
             )
@@ -252,13 +258,14 @@ def draw_angle_text(frame: np.ndarray, finger_angles: Dict[str, FingerAngles],
     for finger_name, angles in finger_angles.items():
         text = (
             f"{finger_name.capitalize():6s} | "
-            f"MCP {angles.mcp:6.1f} "
+            f"MCP_f {angles.mcp_flex:6.1f} "
+            f"MCP_a {angles.mcp_abd:6.1f} "
             f"PIP {angles.pip:6.1f} "
-            f"DIP {angles.dip:6.1f} "
+            f"DIP {angles.dip:6.1f}"
         )
 
-        cv.putText(frame, text, (x0, y), cv.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 1, cv.LINE_AA)
-        y += 22
+        cv.putText(frame, text, (x0, y), cv.FONT_HERSHEY_SIMPLEX, 0.49, (0, 255, 0), 1, cv.LINE_AA)
+        y += 23
         
 
 def main() -> None:
