@@ -47,6 +47,10 @@ def flexion_angle_deg(p_prox: np.ndarray, p_joint: np.ndarray, p_dist: np.ndarra
     interior = angle_between_vectors_deg(v1, v2)
     return 180.0 - interior
 
+class SavitzkyGolayFilter:
+    def __init__(self):
+        pass
+
 class ExponentialMovingAverage:
     def __init__(self, alpha: float = 0.25):
         if not (0.0 < alpha <= 1.0):
@@ -104,6 +108,10 @@ class MediapipeAngleEstimator:
     #thumb omitted due to laziness
     WRIST = 0
 
+    INDEX_MCP = 5
+    MIDDLE_MCP = 9
+    PINKY_MCP = 17
+
     FINGER_LANDMARKS = {
         "index": {"mcp": 5, "pip": 6, "dip": 7, "tip": 8},
         "middle": {"mcp": 9, "pip": 10, "dip": 11, "tip": 12},
@@ -134,6 +142,36 @@ class MediapipeAngleEstimator:
             for i, lm in enumerate(lms)
         }
     
+    def build_palm_frame(self, landmarks: Dict[int, Landmark3D]) -> Optional[np.ndarray]:
+        wrist = landmarks[self.WRIST].as_array()
+        index_mcp = landmarks[self.INDEX_MCP].as_array()
+        middle_mcp = landmarks[self.MIDDLE_MCP].as_array()
+        pinky_mcp = landmarks[self.PINKY_MCP].as_array()
+
+        across_palm = normalize(pinky_mcp - index_mcp)
+        y_seed = normalize(middle_mcp - wrist)
+        palm_normal = normalize(np.cross(across_palm, y_seed))
+
+        epsilon = 1e-7
+        if np.linalg.norm(across_palm) < epsilon or np.linalg.norm(y_seed) < epsilon or np.linalg.norm(palm_normal) < epsilon:
+            return None
+        
+        y_palm = normalize(np.cross(palm_normal, across_palm))
+        if np.linalg.norm(y_palm) < epsilon:
+            return None
+        
+        R_palm = np.column_stack((across_palm, y_palm, palm_normal))
+        return R_palm
+    
+    def mcp_flexion_from_palm(self, mcp: np.ndarray, pip: np.ndarray, R_palm: np.ndarray):
+        finger_axis = normalize(pip - mcp)
+        v_local = R_palm.T @ finger_axis
+        vx, vy, vz = v_local
+
+        in_plane_norm = math.sqrt(vx * vx + vy * vy)
+        flexion_deg = math.degrees(math.atan2(abs(vz), in_plane_norm))
+        return flexion_deg
+    
     def maybe_filter(self, key: str, value: float) -> float:
         if not self.use_ema:
             return value
@@ -143,8 +181,13 @@ class MediapipeAngleEstimator:
         landmarks = self.extract_world_landmarks(result, hand_index)
         if landmarks is None:
             return None
+        
+        palm_frame = self.build_palm_frame(landmarks)
+        if palm_frame is None:
+            return None
 
-        wrist = landmarks[self.WRIST].as_array()
+        #wrist = landmarks[self.WRIST].as_array()
+        
         out: Dict[str, FingerAngles] = {}
 
         for finger_name, index in self.FINGER_LANDMARKS.items():
@@ -153,7 +196,9 @@ class MediapipeAngleEstimator:
             dip = landmarks[index["dip"]].as_array()
             tip = landmarks[index["tip"]].as_array()
 
-            mcp_angle_raw = flexion_angle_deg(wrist, mcp, pip)
+            #mcp_angle_raw = flexion_angle_deg(wrist, mcp, pip)
+            mcp_angle_raw = self.mcp_flexion_from_palm(mcp, pip, palm_frame)
+
             pip_angle_raw = flexion_angle_deg(mcp, pip, dip)
             dip_angle_raw = flexion_angle_deg(pip, dip, tip)
 
@@ -227,7 +272,10 @@ def main() -> None:
         min_tracking_confidence = 0.6
     )
 
-    angle_estimator = MediapipeAngleEstimator()
+    angle_estimator = MediapipeAngleEstimator(
+        ema_alpha=0.25,
+        use_ema=True
+    )
     
     cap = cv.VideoCapture(0)
     if not cap.isOpened():
