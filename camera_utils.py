@@ -308,6 +308,147 @@ def calibrate_charuco_from_folder(
     save_calibration_yaml(output_yaml, camera_matrix, dist_coeffs)
     return camera_matrix, dist_coeffs, float(ret), used_images
 
+def generate_charuco_board_image(
+    output_path: str,
+    squares_x: int,
+    squares_y: int,
+    square_length_mm: float,
+    marker_length_mm: float,
+    dict_name: int,
+    dpi: int = 300,
+    margin_px: int = 40,
+    status_cb=None,
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    if square_length_mm <= 0 or marker_length_mm <= 0:
+        raise ValueError("Square length and marker length must be positive.")
+    if marker_length_mm >= square_length_mm:
+        raise ValueError("Marker length must be smaller than square length.")
+    if dpi <= 0:
+        raise ValueError("DPI must be positive.")
+
+    aruco_dict = cv.aruco.getPredefinedDictionary(dict_name)
+    board = cv.aruco.CharucoBoard(
+        size=(squares_x, squares_y),
+        squareLength=float(square_length_mm),
+        markerLength=float(marker_length_mm),
+        dictionary=aruco_dict,
+    )
+
+    px_per_mm = dpi / 25.4
+    board_w = max(1, int(round(squares_x * square_length_mm * px_per_mm)))
+    board_h = max(1, int(round(squares_y * square_length_mm * px_per_mm)))
+    out_size = (board_w, board_h)
+    img = board.generateImage(out_size, marginSize=int(margin_px), borderBits=1)
+
+    ok = cv.imwrite(output_path, img)
+    if not ok:
+        raise IOError(f"Failed to write ChArUco board image to: {output_path}")
+
+    if status_cb:
+        status_cb(f"Saved board image -> {output_path} ({board_w}x{board_h} px at {dpi} DPI)")
+    return img, out_size
+
+
+class CalibrationImageCapture:
+    def __init__(
+        self,
+        camera_id: int,
+        output_dir: str,
+        prefix: str = "charuco",
+        annotate: bool = True,
+        toolkit: Optional[ArucoToolkit] = None,
+        countdown_seconds: float = 0.0,
+        max_images: int = 0,
+    ):
+        self.camera_id = camera_id
+        self.output_dir = output_dir
+        self.prefix = prefix
+        self.annotate = annotate
+        self.toolkit = toolkit
+        self.countdown_seconds = max(0.0, float(countdown_seconds))
+        self.max_images = max(0, int(max_images))
+        self.stop_flag = False
+
+    def stop(self):
+        self.stop_flag = True
+
+    def run(self, status_cb=None):
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        capture = cv.VideoCapture(self.camera_id)
+        if not capture.isOpened():
+            raise IOError(f"Cannot open camera {self.camera_id}")
+
+        saved_count = 0
+        last_capture_time = 0.0
+        pending_auto_capture = False
+
+        if status_cb:
+            status_cb("Calibration capture started. Keys: s=save, a=toggle auto-capture, q=quit.")
+
+        while not self.stop_flag:
+            ret, frame = capture.read()
+            if not ret:
+                break
+
+            display_frame = frame.copy()
+            if self.annotate and self.toolkit is not None:
+                display_frame, _, ids = self.toolkit.annotate_frame(frame, draw_axes=False)
+                detected_count = 0 if ids is None else len(ids)
+            else:
+                corners = ids = None
+                if self.toolkit is not None:
+                    corners, ids, _ = self.toolkit.detect_markers(frame)
+                    if ids is not None and len(ids) > 0:
+                        cv.aruco.drawDetectedMarkers(display_frame, corners, ids)
+                detected_count = 0 if ids is None else len(ids)
+
+            now = time.time()
+            wait_left = max(0.0, self.countdown_seconds - (now - last_capture_time)) if pending_auto_capture else 0.0
+            ready_for_auto = pending_auto_capture and wait_left <= 1e-6
+
+            status_line = f"saved: {saved_count} | markers: {detected_count}"
+            if pending_auto_capture:
+                status_line += f" | auto in {wait_left:.1f}s" if not ready_for_auto else " | auto capture ready"
+
+            cv.putText(display_frame, status_line, (20, 35), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv.LINE_AA)
+            cv.putText(display_frame, "s=save  a=auto  q=quit", (20, 68), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv.LINE_AA)
+            cv.imshow("charuco_capture", display_frame)
+
+            should_save = False
+            key = cv.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("s"):
+                should_save = True
+            elif key == ord("a"):
+                pending_auto_capture = not pending_auto_capture
+                last_capture_time = now
+                if status_cb:
+                    status_cb(f"Auto-capture {'enabled' if pending_auto_capture else 'disabled'}.")
+
+            if ready_for_auto:
+                should_save = True
+
+            if should_save:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"{self.prefix}_{timestamp}_{saved_count+1:03d}.jpg"
+                path = str(Path(self.output_dir) / filename)
+                ok = cv.imwrite(path, frame)
+                if not ok:
+                    raise IOError(f"Failed to save image: {path}")
+                saved_count += 1
+                last_capture_time = time.time()
+                if status_cb:
+                    status_cb(f"Saved calibration image -> {path}")
+                if self.max_images > 0 and saved_count >= self.max_images:
+                    if status_cb:
+                        status_cb(f"Reached max image count: {self.max_images}")
+                    break
+
+        capture.release()
+        cv.destroyWindow("charuco_capture")
+        if status_cb:
+            status_cb(f"Calibration capture stopped. Saved {saved_count} image(s).")
 
 class LiveRecorder:
     def __init__(self, camera_id: int, output_path: str, annotate: bool, toolkit: Optional[ArucoToolkit], fps_override: int = 0):
@@ -607,6 +748,17 @@ class CameraUtilsApp(tk.Tk):
         self.square_length_var = tk.DoubleVar(value=20.0)
         self.charuco_marker_length_var = tk.DoubleVar(value=15.0)
         self.calib_preview_var = tk.BooleanVar(value=True)
+        self.board_output_var = tk.StringVar(value="charuco_board.png")
+        self.board_dpi_var = tk.IntVar(value=300)
+        self.board_margin_var = tk.IntVar(value=40)
+
+        # calibration image capture
+        self.capture_dir_var = tk.StringVar(value="calibration_images")
+        self.capture_prefix_var = tk.StringVar(value="charuco")
+        self.capture_camera_id_var = tk.IntVar(value=0)
+        self.capture_countdown_var = tk.DoubleVar(value=2.0)
+        self.capture_max_images_var = tk.IntVar(value=0)
+        self.capture_annotate_var = tk.BooleanVar(value=True)
 
         # aruco config
         self.dict_name_var = tk.StringVar(value="DICT_4X4_50")
@@ -642,16 +794,19 @@ class CameraUtilsApp(tk.Tk):
         notebook.pack(fill="both", expand=True)
 
         self.tab_calib = ttk.Frame(notebook)
+        self.tab_capture = ttk.Frame(notebook)
         self.tab_live = ttk.Frame(notebook)
         self.tab_play = ttk.Frame(notebook)
         self.tab_proc = ttk.Frame(notebook)
 
         notebook.add(self.tab_calib, text="ChArUco Calibration")
+        notebook.add(self.tab_capture, text="Capture Calibration Images")
         notebook.add(self.tab_live, text="Live Recording")
         notebook.add(self.tab_play, text="MP4 Playback")
         notebook.add(self.tab_proc, text="MP4 ArUco + CSV")
 
         self._build_calib_tab(self.tab_calib)
+        self._build_capture_tab(self.tab_capture)
         self._build_live_tab(self.tab_live)
         self._build_play_tab(self.tab_play)
         self._build_proc_tab(self.tab_proc)
@@ -693,7 +848,36 @@ class CameraUtilsApp(tk.Tk):
         self._entry_num(parent, 6, "Square length (mm)", self.square_length_var)
         self._entry_num(parent, 7, "Marker length (mm)", self.charuco_marker_length_var)
         ttk.Checkbutton(parent, text="Preview detections while calibrating", variable=self.calib_preview_var).grid(row=8, column=1, sticky="w", padx=8, pady=6)
-        ttk.Button(parent, text="Run Calibration", style="Success.TButton", command=self.start_calibration).grid(row=9, column=1, sticky="w", padx=8, pady=14)
+        ttk.Separator(parent, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 10))
+        ttk.Label(parent, text="Board image output").grid(row=10, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(parent, textvariable=self.board_output_var, width=48).grid(row=10, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Button(parent, text="Browse", command=self._browse_board_output).grid(row=10, column=2, sticky="ew", padx=8, pady=6)
+        self._entry_num(parent, 11, "Board DPI", self.board_dpi_var)
+        self._entry_num(parent, 12, "Board margin (px)", self.board_margin_var)
+        btns = ttk.Frame(parent)
+        btns.grid(row=13, column=1, sticky="w", padx=8, pady=14)
+        ttk.Button(btns, text="Run Calibration", style="Success.TButton", command=self.start_calibration).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Generate Board Image", command=self.generate_board_image).pack(side="left")
+
+    def _build_capture_tab(self, parent):
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text="Capture and save ChArUco calibration photos from the live camera.", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(10, 14))
+        self._row(parent, 1, "Output folder", self.capture_dir_var, self._browse_capture_dir)
+        self._row(parent, 2, "Calibration YAML (optional, for axes)", self.calib_yaml_var, self._browse_calib_yaml)
+        self._dict_dropdown(parent, 3)
+        self._entry_num(parent, 4, "Pose marker length (mm)", self.pose_marker_length_var)
+        self._entry_num(parent, 5, "Camera ID", self.capture_camera_id_var)
+        self._entry_num(parent, 6, "Countdown / auto interval (s)", self.capture_countdown_var)
+        self._entry_num(parent, 7, "Max images (0 = unlimited)", self.capture_max_images_var)
+        ttk.Label(parent, text="Filename prefix").grid(row=8, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(parent, textvariable=self.capture_prefix_var, width=18).grid(row=8, column=1, sticky="w", padx=8, pady=6)
+        ttk.Checkbutton(parent, text="Annotate detected markers during capture", variable=self.capture_annotate_var).grid(row=9, column=1, sticky="w", padx=8, pady=6)
+        note = "In the OpenCV window: s=save one image, a=toggle timed auto-capture, q=quit."
+        ttk.Label(parent, text=note).grid(row=10, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
+        btns = ttk.Frame(parent)
+        btns.grid(row=11, column=1, sticky="w", padx=8, pady=14)
+        ttk.Button(btns, text="Start Capture", style="Success.TButton", command=self.start_capture_images).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Stop", style="Danger.TButton", command=self.stop_current_task).pack(side="left")
 
     def _build_live_tab(self, parent):
         parent.columnconfigure(1, weight=1)
@@ -875,9 +1059,81 @@ class CameraUtilsApp(tk.Tk):
 
         self._run_in_thread(job, controller=controller)
 
+    def generate_board_image(self):
+        def job():
+            try:
+                _, size = generate_charuco_board_image(
+                    output_path=self.board_output_var.get().strip(),
+                    squares_x=int(self.squares_x_var.get()),
+                    squares_y=int(self.squares_y_var.get()),
+                    square_length_mm=float(self.square_length_var.get()),
+                    marker_length_mm=float(self.charuco_marker_length_var.get()),
+                    dict_name=self._dict_code(),
+                    dpi=int(self.board_dpi_var.get()),
+                    margin_px=int(self.board_margin_var.get()),
+                    status_cb=self.log,
+                )
+                self.log(f"Board image dimensions: {size[0]} x {size[1]} px")
+            except Exception as exc:
+                self.log(f"Board generation failed: {exc}")
+                messagebox.showerror("Board Generation Error", str(exc))
+        self._run_in_thread(job)
+
+    def start_capture_images(self):
+        try:
+            toolkit = None
+            if self.capture_annotate_var.get():
+                try:
+                    toolkit = self._build_toolkit()
+                except Exception:
+                    toolkit = ArucoToolkit(
+                        aruco_dict_name=self._dict_code(),
+                        marker_length_mm=float(self.pose_marker_length_var.get()),
+                        calibration=None,
+                    )
+            else:
+                toolkit = ArucoToolkit(
+                    aruco_dict_name=self._dict_code(),
+                    marker_length_mm=float(self.pose_marker_length_var.get()),
+                    calibration=None,
+                )
+
+            controller = CalibrationImageCapture(
+                camera_id=int(self.capture_camera_id_var.get()),
+                output_dir=self.capture_dir_var.get().strip(),
+                prefix=self.capture_prefix_var.get().strip(),
+                annotate=bool(self.capture_annotate_var.get()),
+                toolkit=toolkit,
+                countdown_seconds=float(self.capture_countdown_var.get()),
+                max_images=int(self.capture_max_images_var.get()),
+            )
+        except Exception as exc:
+            messagebox.showerror("Setup Error", str(exc))
+            return
+
+        def job():
+            try:
+                controller.run(status_cb=self.log)
+            except Exception as exc:
+                self.log(f"Calibration image capture failed: {exc}")
+                messagebox.showerror("Capture Error", str(exc))
+
+        self._run_in_thread(job, controller=controller)
+
     # -------------------------
     # Browse helpers
     # -------------------------
+    def _browse_board_output(self):
+        p = filedialog.asksaveasfilename(title="Save board image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")])
+        if p:
+            self.board_output_var.set(p)
+
+    def _browse_capture_dir(self):
+        p = filedialog.askdirectory(title="Select output folder for calibration images")
+        if p:
+            self.capture_dir_var.set(p)
+            self.calib_dir_var.set(p)
+
     def _browse_calib_dir(self):
         p = filedialog.askdirectory(title="Select calibration image folder")
         if p:
@@ -918,7 +1174,6 @@ class CameraUtilsApp(tk.Tk):
         p = filedialog.asksaveasfilename(title="Save CSV", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if p:
             self.proc_output_csv_var.set(p)
-
 
 if __name__ == "__main__":
     app = CameraUtilsApp()
